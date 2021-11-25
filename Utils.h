@@ -98,6 +98,17 @@ namespace GWS {
         */
         inline std::tuple<unsigned char*, size_t> encode(unsigned char* buff, size_t len, int opCode = 2) {
             if (len == 0) return std::tuple<unsigned char*, size_t>((unsigned char*)nullptr, 0);
+            if (len < 126) {
+                auto onelen = 2 + len;
+                auto onebuff = (char*)malloc(onelen);
+                memset(onebuff, 0, onelen);
+                onebuff[0] = (unsigned char)0x80;
+                onebuff[0] += (unsigned char)opCode;
+                onebuff[1] += (unsigned char)len;
+                memcpy(&onebuff[2], buff, len);
+                return std::tuple<unsigned char*, size_t>((unsigned char*)onebuff, onelen);
+            }
+
             //16K 分片
             int segment_len = 16 * 1024;
             int segment_count = len / segment_len;
@@ -110,9 +121,10 @@ namespace GWS {
             unsigned char first[4] = { 0, 0, 0, 0 };
             unsigned char mid[4] = { 0, 0, 0, 0 };
             unsigned char end[4] = { 0, 0, 0, 0 };
+            int header_len = 4;
             if (segment_count == 0) {
                 end[0] = (unsigned char)0x80;
-                end[0] += opCode;
+                end[0] += (unsigned char)opCode;
                 end[1] += 126;
                 end[2] = (last & 0xff00) >> 8;
                 end[3] = (last & 0xff);
@@ -157,6 +169,9 @@ namespace GWS {
             memcpy(&sendbuff[offset], &buff[len - last], last);
 
             assert(offset + last == sendlen);
+
+            WSHeader header;
+            decodeWSHeader(header, (unsigned char*)sendbuff, sendlen);
 
             return std::tuple<unsigned char*, size_t>((unsigned char*)sendbuff, sendlen);
         }

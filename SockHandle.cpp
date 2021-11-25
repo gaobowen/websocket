@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <tuple>
 #include <thread>
+#include <sys/epoll.h>
 
 using namespace std;
 
@@ -61,7 +62,7 @@ namespace GWS {
                         key = url.substr(begin + 1, split - begin - 1);
                         value = url.substr(split + 1, end - split - 1); //4-2-1=1
                     }
-                    
+
                 }
                 else {
                     auto end = next;
@@ -73,10 +74,10 @@ namespace GWS {
                     begin = next;
                 }
 
-                if(!key.empty()) {
+                if (!key.empty()) {
                     handle->query[key] = value;
                 }
-            
+
                 //printf("key-value %s = %s\n", key.c_str(), value.c_str());
                 if (next == url.npos) break;
 
@@ -97,10 +98,13 @@ namespace GWS {
     }
 
     int SockHandle::header_value_cb(http_parser* p, const char* buf, size_t len) {
-        string value = string(buf, len);
+        char* key = (char*)malloc(len);
+        memcpy(key, buf, len);
+        string value = string(key, len);
         //printf("value=%s\n", value.c_str());
         auto handle = (SockHandle*)p->data;
-        if (handle && handle->canWSKey && handle->wsKey.empty()) {
+        if (handle && !handle->is_closing && handle->canWSKey && handle->wsKey.empty()) {
+            printf("%s\n", value.c_str());
             handle->wsKey = value;
         }
         return 0;
@@ -118,29 +122,13 @@ namespace GWS {
         string resqstr = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ";
         resqstr += string(secWebSocketAccept64);
         resqstr += "\r\n\r\n";
-        char* cstr = (char*)resqstr.c_str();
-        uv_write_t* req = (uv_write_t*)malloc(sizeof(uv_write_t));
-        uv_buf_t uvBuf = uv_buf_init(cstr, strlen(cstr));
 
-        //发送buffer数组，第四个参数表示数组大小
-        auto writecb = [](uv_write_t* req, int status) {
-            free(req);
-        };
-        if (uv_write(req, (uv_stream_t*)handle->client, &uvBuf, 1, writecb) == 0) {
-            handle->isHandshaked = true;
-            if (handle->OnOpen) {
-                SockReadAccessor accessor;
-                if (collector.find(accessor, handle)) {
-                    auto h = accessor->second;
-                    if (h->OnOpen) h->OnOpen(h);
-                }
-                accessor.release();
-            }
-        }
-        else {
-            auto req = (uv_shutdown_t*)malloc(sizeof(uv_shutdown_t));
-            uv_shutdown(req, (uv_stream_t*)handle->client, SockHandle::tcp_shutdown);
-        }
+        char* cstr = (char*)resqstr.c_str();
+        size_t len = strlen(cstr);
+        char* send = (char*)malloc(strlen(cstr));
+        memcpy(send, cstr, len);
+        handle->addSendTask(send, strlen(cstr));
+
         return 0;
     }
     int SockHandle::body_cb(http_parser* p, const char* at, size_t length) { return 0; }
@@ -152,48 +140,17 @@ namespace GWS {
 
 #pragma endregion
 
-    void SockHandle::tcp_shutdown(uv_shutdown_t* req, int status) {
-        auto client = reinterpret_cast<uv_handle_t*>(req->handle);
-        if (!client || client->flags & 0x00000001 || client->flags & 0x00000002) return;
-        uv_close(client, SockHandle::tcp_close);
-        free(req);
-    }
-
-    void SockHandle::tcp_close(uv_handle_t* client) {
-        if (client) {
-            auto handle = reinterpret_cast<SockHandle*>(client->data);
-            if (handle) {
-                handle->is_closed = true;
-                SockReadAccessor accessor;
-                if (collector.find(accessor, handle)) {
-                    auto h = accessor->second;
-                    if (h->OnClosed) h->OnClosed(h);
-                }
-                accessor.release();
-                collector.erase(handle);
-
-                // delete handle;
-                // client->data = nullptr;
-            }
-            //在析构中释放
-            //free(client); 
-        }
-    }
-
-    void SendCallBack(uv_async_t* handle);
-
-    void TestMultithreadingSend(SockHandle* handle, char* buff, size_t len);
 
     SockHandle::SockHandle() {
         is_closed = false;
-
+        is_closing = false;
         //printf("New SockHandle %p\n", this);
     }
 
     void SockHandle::SetClient(void* client) {
-        this->client = client;
-        async_handle.data = this;
-        uv_async_init(uv_default_loop(), &async_handle, SendCallBack);
+        // this->client = client;
+        // async_handle.data = this;
+        // uv_async_init(uv_default_loop(), &async_handle, SendCallBack);
     }
 
     // int allpayload = 0;
@@ -205,11 +162,11 @@ namespace GWS {
             http_parser_init(&parser, HTTP_REQUEST);
             parser.data = this;
             size_t np = http_parser_execute(&parser, &settings, buff, len);
-            if (np != len || !isHandshaked) {
-                printf("http protocol error. %ld\n", parser.http_errno);
-                auto req = (uv_shutdown_t*)malloc(sizeof(uv_shutdown_t));
-                uv_shutdown(req, (uv_stream_t*)client, SockHandle::tcp_shutdown);
-            }
+            // if (np != len || !isHandshaked) {
+            //     printf("http protocol error. %ld\n", parser.http_errno);
+            //     //auto req = (uv_shutdown_t*)malloc(sizeof(uv_shutdown_t));
+            //     //uv_shutdown(req, (uv_stream_t*)client, SockHandle::tcp_shutdown);
+            // }
         }
         else {
             //allbuffer += len;
@@ -224,7 +181,7 @@ namespace GWS {
                 frames_total += wsHeader.payload;
                 //allpayload += wsHeader.payload;
                 if (remainBytes >= 0) {
-                    memcpy(payLoadData, &buff[wsHeader.dataOffset], len);
+                    memcpy(payLoadData, &buff[wsHeader.dataOffset], len - wsHeader.dataOffset);
                 }
                 else { // remainBytes < 0
                     memcpy(payLoadData, &buff[wsHeader.dataOffset], wsHeader.frameLength);
@@ -306,10 +263,18 @@ namespace GWS {
         frames_total = 0;
         frames.clear();
 
-        printf("total=%ld\n", total);
+        // printf("total=%ld\n", total);
+        // if(total > 16) {
+        //     printf("msg=%s\n", string(&msg[16], total -16).c_str());
+        // }
 
 
         //todo opcode == close
+        if (opCode == 0x08) {
+            SockHandle::CloseHandle(this);
+            return;
+        }
+
         if (OnMessage) {
             SockReadAccessor accessor;
             if (collector.find(accessor, this)) {
@@ -319,90 +284,36 @@ namespace GWS {
             accessor.release();
         }
 
-        //free(msg);
-
-        // auto workreq = (uv_work_t*)malloc(sizeof(uv_work_t));
-        // workreq->data = new std::tuple<char*, size_t, void*>(msg, total, this);
-
-        // auto work = [](uv_work_t* req) {
-        //     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        //     auto tuple = (std::tuple<char*, size_t, void*>*)req->data;
-        //     auto msg = std::get<0>(*tuple);
-        //     auto total = std::get<1>(*tuple);
-        //     auto handle = (SockHandle*)std::get<2>(*tuple);
-        //     SockAccessor accessor;
-        //     if (collector.find(accessor, handle)) {
-        //         auto sock = accessor->second;
-        //         if (sock->is_closed) return;
-        //         auto client = (uv_handle_t*)sock->client;
-        //         if (client->flags & 0x00000001 || client->flags & 0x00000002) {
-        //             return;
-        //         }
-        //         auto temp = (char*)malloc(total);
-        //         memcpy(temp, msg, total);
-        //         sock->addSendTask(temp, total);
-        //         printf("SendData=1 \n");
-        //     }
-
-        //     //SendBuffer(msg, total);
-        // };
-
-        // auto afterwork = [](uv_work_t* req, int status) {
-        //     auto tuple = (std::tuple<char*, size_t, void*>*)req->data;
-        //     auto handle = (SockHandle*)std::get<2>(*tuple);
-        //     delete tuple;
-
-        //     //client->mutex.unlock();
-        //     free(req);
-
-        // };
-
-        // printf("SendData=0 \n");
-
-        // uv_queue_work(uv_default_loop(), workreq, work, afterwork);
-
 #ifdef ON_MESSAGE_FREE
         free(msg);
 #endif
     }
 
-    void SendCallBack(uv_async_t* handle) {
-        auto sock = reinterpret_cast<SockHandle*>(handle->data);
-        if (sock && !sock->is_closed) {
-            auto client = (uv_stream_t*)sock->client;
-            /*
-            UV_HANDLE_CLOSING                     = 0x00000001,
-            UV_HANDLE_CLOSED                      = 0x00000002,
-            */
-            if (client->flags & 0x00000001 || client->flags & 0x00000002) {
-                return;
-            }
-
-            auto writecb = [](uv_write_t* req, int status) {
-                if (req->data) free(req->data); //free(buff);
-                free(req);
-            };
+    void SockHandle::SendCallBack() {
+        if (!is_closed) {
             tuple<char*, size_t> t;
-            while (sock->sendQueue.try_dequeue(t)) {
+            while (sendQueue.try_dequeue(t)) {
                 auto buff = get<0>(t);
                 auto len = get<1>(t);
-                uv_write_t* req = (uv_write_t*)malloc(sizeof(uv_write_t));
-                uv_buf_t uvBuf = uv_buf_init((char*)buff, len);
-                req->data = uvBuf.base;
-                if (!(uv_is_writable(client) && uv_write(req, client, &uvBuf, 1, writecb) == 0)) {
-                    printf("uv_write error 2\n");
-                }
-                printf("SendData=2 \n");
+
+                WSHeader header;
+                GWS::Utils::decodeWSHeader(header, (unsigned char*)buff, len);
+
+
 
             }
         }
     }
 
     void SockHandle::addSendTask(char* buff, size_t len) {
-        auto cli = reinterpret_cast<uv_handle_t*>(client);
-        if (is_closed || cli->flags & 0x00000001 || cli->flags & 0x00000002) return;
         sendQueue.try_enqueue(tuple<char*, size_t>(buff, len));
-        uv_async_send(&async_handle);
+        epoll_event event;
+        event.data.ptr = this;
+        event.events = EPOLLIN | EPOLLET | EPOLLOUT;
+        int s = epoll_ctl(efd, EPOLL_CTL_MOD, fd, &event);
+        if (s == -1) {
+            perror("addSendTask");
+        }
     }
 
     void SockHandle::SendBuffer(SockHandle* handle, char* buff, size_t len, int opCode) {
@@ -413,7 +324,6 @@ namespace GWS {
             auto sendbuff = get<0>(rettuple);
             auto sendlen = get<1>(rettuple);
             sock->addSendTask((char*)sendbuff, sendlen);
-            printf("SendData=1 \n");
         }
     }
 
@@ -421,17 +331,21 @@ namespace GWS {
         SockReadAccessor accessor;
         if (collector.find(accessor, handle)) {
             auto sock = accessor->second;
-            if (sock->is_closed) return;
-            auto req = (uv_shutdown_t*)malloc(sizeof(uv_shutdown_t));
-            uv_shutdown(req, (uv_stream_t*)sock->client, SockHandle::tcp_shutdown);
+            if (sock->is_closed || sock->is_closing) return;
+            sock->is_closing = true;
+            epoll_event event;
+            event.data.ptr = handle;
+            event.events = EPOLLIN | EPOLLET | EPOLLOUT;
+            epoll_ctl(sock->efd, EPOLL_CTL_MOD, sock->fd, &event);
+            printf("=============CloseHandle=================\n");
         }
     }
 
     SockHandle::~SockHandle() {
         is_closed = true;
         printf("~SockHandle()\n");
-        async_handle.data = nullptr;
-        uv_close((uv_handle_t*)&async_handle, 0);
+        //async_handle.data = nullptr;
+        //uv_close((uv_handle_t*)&async_handle, 0);
 
         //清理读取缓冲区
         size_t count = frames.size();
@@ -446,8 +360,10 @@ namespace GWS {
             free(get<0>(item));
         }
 
-        if (client) free(client);
-        client = nullptr;
+        auto buf = std::get<0>(remainSend);
+        if (buf) free(buf);
+
+        if(OnDispose) OnDispose(this);
 
     }
 

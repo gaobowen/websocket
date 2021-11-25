@@ -24,7 +24,7 @@ namespace GWS {
     class SockHandle
     {
     private:
-        bool isHandshaked = false;
+        
         bool canWSKey = false;
         string wsKey = "";
         vector<tuple<char*, size_t>> frames;
@@ -41,19 +41,27 @@ namespace GWS {
     public:
         SockHandle();
         ~SockHandle();
+        bool isHandshaked = false;
         string path;
         map<string, string> query;
-        std::atomic_bool is_closed;
+        atomic_bool is_closing;
+        atomic_bool is_closed;
         SendQueue sendQueue;
+        tuple<char*, size_t, size_t> remainSend;
         void* client;
-        void* data;
+        int fd;
+        int efd;
+        void* data = nullptr;
         void ReadBuffer(char* buff, size_t len);
+        void SendCallBack();
         static void SendBuffer(SockHandle* handle, char* buff, size_t len, int opCode);
         static void CloseHandle(SockHandle* handle);
         void SetClient(void* client);
+    
         std::function<void(std::shared_ptr<SockHandle> sock)> OnOpen;
         std::function<void(std::shared_ptr<SockHandle> sock, const char* msg, size_t len, int opCode)> OnMessage;
         std::function<void(std::shared_ptr<SockHandle> sock)> OnClosed;
+        std::function<void(SockHandle* sock)> OnDispose;
         static int message_begin_cb(http_parser* p);
         static int url_cb(http_parser* p, const char* at, size_t length);
         static int status_cb(http_parser* p, const char* at, size_t length);
@@ -64,8 +72,6 @@ namespace GWS {
         static int message_complete_cb(http_parser* p);
         static int chunk_header_cb(http_parser* p);
         static int chunk_complete_cb(http_parser* p);
-        static void tcp_shutdown(uv_shutdown_t* req, int status);
-        static void tcp_close(uv_handle_t* client);
         static http_parser_settings settings;
     };
 
