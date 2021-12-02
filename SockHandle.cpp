@@ -48,7 +48,7 @@ namespace GWS {
         if (querylen > 2 && at[pos1] == '?') {
             //size_t len = querylen - 1;
             auto querystr = url.substr(pos1, querylen);
-            //printf("querystr %s\n", querystr.c_str());
+            printf("querystr %s\n", querystr.c_str());
             size_t begin = pos1;
             //?a=b&c=d
             while (true) {
@@ -56,7 +56,7 @@ namespace GWS {
                 string value = "";
                 auto next = url.find('&', begin + 1);
                 if (next == url.npos) {
-                    auto end = querylen;
+                    auto end = querylen + pos1;
                     auto split = url.find('=', begin);
                     if (split != url.npos) {
                         key = url.substr(begin + 1, split - begin - 1);
@@ -104,7 +104,7 @@ namespace GWS {
         //printf("value=%s\n", value.c_str());
         auto handle = (SockHandle*)p->data;
         if (handle && !handle->is_closing && handle->canWSKey && handle->wsKey.empty()) {
-            printf("%s\n", value.c_str());
+            //printf("%s\n", value.c_str());
             handle->wsKey = value;
         }
         return 0;
@@ -184,7 +184,7 @@ namespace GWS {
                     memcpy(payLoadData, &buff[wsHeader.dataOffset], len - wsHeader.dataOffset);
                 }
                 else { // remainBytes < 0
-                    memcpy(payLoadData, &buff[wsHeader.dataOffset], wsHeader.frameLength);
+                    memcpy(payLoadData, &buff[wsHeader.dataOffset], wsHeader.payload);
                     if ((buff[len + remainBytes] & 0x70) == 0) { //isError=0
                         auto left = -remainBytes;
                         remainBytes = 0;
@@ -196,6 +196,7 @@ namespace GWS {
                         ReadBuffer(&buff[len - left], left); //remainBytes = 0;
                     }
                     else {
+                        throw("aaaa");
                         //todo close
                     }
                     return;
@@ -306,6 +307,7 @@ namespace GWS {
     }
 
     void SockHandle::addSendTask(char* buff, size_t len) {
+        if(is_closing) return;
         sendQueue.try_enqueue(tuple<char*, size_t>(buff, len));
         epoll_event event;
         event.data.ptr = this;
@@ -320,6 +322,7 @@ namespace GWS {
         SockReadAccessor accessor;
         if (collector.find(accessor, handle)) {
             auto sock = accessor->second;
+            if(sock->is_closing) return;
             auto rettuple = Utils::encode((unsigned char*)buff, len, opCode);
             auto sendbuff = get<0>(rettuple);
             auto sendlen = get<1>(rettuple);

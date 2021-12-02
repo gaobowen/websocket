@@ -2,6 +2,7 @@
 
 #include "EpollServer.h"
 #include <sys/ioctl.h>
+#include <execinfo.h>
 
 #define MAXEVENTS 64
 
@@ -9,10 +10,32 @@ using namespace GWS;
 
 static int make_socket_non_blocking(int sfd);
 
-//函数:
-//功能:创建和绑定一个TCP socket
-//参数:端口
-//返回值:创建的socket
+void signal_handle(int signal)
+{
+    void* l_buffer[1024];
+    char** l_ptrace;
+
+    printf("\r\n=========>>>catch signal %d <<<=========\r\n", signal);
+    printf("Dump stack start...\n");
+
+    int size = backtrace(l_buffer, 512);
+    l_ptrace = backtrace_symbols(l_buffer, size);
+    if (NULL == l_ptrace)
+    {
+        perror("backtrace_symbols");
+        exit(1);
+    }
+
+    for (int i = 0; i < size; i++)
+    {
+        fprintf(stdout, "  [%02d] %s\n", i, l_ptrace[i]);
+    }
+
+    printf("Dump stack end...\n");
+    free(l_ptrace);
+    exit(1);
+}
+
 static int create_and_bind(char* port)
 {
     struct addrinfo hints;
@@ -60,7 +83,14 @@ static int create_and_bind(char* port)
     }
 
     if (rp == NULL) {
-        fprintf(stderr, "Could not bind\n");
+        perror("Could not bind");
+
+    }
+
+    int sfdflag = 1;
+    if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &sfdflag, sizeof(sfdflag)) < 0)
+    {
+        printf("socket setsockopt error=%d(%s)!!!\n", errno, strerror(errno));
         return -1;
     }
 
@@ -74,18 +104,16 @@ static int create_and_bind(char* port)
 //功能:设置socket为非阻塞的
 static int make_socket_non_blocking(int sfd) {
     int flags, s;
-    //得到文件状态标志
     flags = fcntl(sfd, F_GETFL, 0);
     if (flags == -1) {
         perror("fcntl get");
         return -1;
     }
 
-    //设置文件状态标志
     flags |= O_NONBLOCK;
     s = fcntl(sfd, F_SETFL, flags);
     if (s == -1) {
-        perror("fcntl set");
+        //perror("fcntl set");
         int on = 1;
         if (ioctl(sfd, FIONBIO, &on) == -1)
         {
@@ -93,7 +121,6 @@ static int make_socket_non_blocking(int sfd) {
             return -1;
         }
     }
-
     return 0;
 }
 
@@ -112,6 +139,13 @@ void handle_close(SockHandle* handle) {
     }
 }
 
+void BlockSigno(int signo) { 
+    sigset_t signal_mask;
+    sigemptyset(&signal_mask); 
+    sigaddset(&signal_mask, signo); 
+    sigprocmask(SIG_BLOCK, &signal_mask, NULL);
+}
+
 namespace GWS
 {
     OpenFunc EpollServer::openHandle = nullptr;
@@ -126,6 +160,11 @@ namespace GWS
 
 
     int EpollServer::Run(char* port) {
+        // signal(SIGSEGV, signal_handle);
+        // signal(SIGFPE, signal_handle);
+
+        BlockSigno(SIGPIPE);
+
         int sfd, s;
         int efd;
         struct epoll_event event;
@@ -169,7 +208,7 @@ namespace GWS
         /* The event loop */
         while (1)
         {
-            printf("start epoll_wait.\n");
+            //printf("start epoll_wait.\n");
             int n = epoll_wait(efd, events, MAXEVENTS, -1);
             for (int i = 0; i < n; i++)
             {
@@ -224,7 +263,7 @@ namespace GWS
                             //abort();
                             printf("connection non_blocking error. \n");
                             close(infd);
-                            break;
+                            continue;
                         }
 
 
@@ -239,9 +278,6 @@ namespace GWS
                         SockPair pair(handle, shared_ptr<SockHandle>(handle));
                         if (!GWS::collector.insert(accessor, pair)) {
                             close(infd);
-                        }
-                        else {
-
                         }
                         accessor.release();
 
@@ -259,19 +295,18 @@ namespace GWS
 
                 auto handle = (SockHandle*)events[i].data.ptr;
                 if (!handle) continue;
-                if (handle->is_closing) {
-                    epoll_ctl(efd, EPOLL_CTL_DEL, handle->fd, 0);
-                    handle_close(handle);
-                    events[i].data.ptr = nullptr;
-                    continue;
-                }
+                // if (handle->is_closing) {
+                //     epoll_ctl(efd, EPOLL_CTL_DEL, handle->fd, 0);
+                //     handle_close(handle);
+                //     events[i].data.ptr = nullptr;
+                //     continue;
+                // }
+                bool isclosed = false;
 
                 if (events[i].events & EPOLLIN) {
-                    int closed = 0;
                     ssize_t count = 0;
                     size_t buflen = 1024 * 32;
                     char buf[buflen];
-
                     int rdfd = handle->fd;
 
                     while (1) {
@@ -283,105 +318,109 @@ namespace GWS
                         if (count == -1) {
                             if (errno != EAGAIN) {
                                 perror("read error");
-                                closed = 1;
+                                handle->is_closing = true;
+                                isclosed = true;
                             } //errno == EAGAIN 数据读完
                             break;
                         }
                         else if (count == 0) { //远程客户端关闭
-                            printf("client closed.\n");
-                            closed = 1;
+                            //printf("client closed.\n");
+                            handle->is_closing = true;
+                            isclosed = true;
                             break;
                         }
 
-                        printf("recv %d total=%d\n", rdfd, count);
+                        //printf("recv %d total=%d\n", rdfd, count);
                     }
 
-                    if (closed || handle->is_closing) {
-                        //printf("Closed connection on descriptor\n");
-                        epoll_ctl(efd, EPOLL_CTL_DEL, handle->fd, 0);
-                        handle_close(handle);
-                        events[i].data.ptr = nullptr;
-                        continue;
-                    }
+                    // if (isclosed) {
+                    //     epoll_ctl(efd, EPOLL_CTL_DEL, handle->fd, 0);
+                    //     handle_close(handle);
+                    //     events[i].data.ptr = nullptr;
+                    //     continue;
+                    // }
                 }
 
-                if (events[i].events & EPOLLOUT) {
-                    if (handle->is_closing || handle->is_closed) {
-                        handle->is_closing = true;
-                        epoll_ctl(efd, EPOLL_CTL_DEL, handle->fd, 0);
-                        handle_close(handle);
-                        events[i].data.ptr = nullptr;
-                        continue;
-                    }
+                if (events[i].events & EPOLLOUT && !isclosed) {
 
-                    //printf("ready to write.\n");
                     char* buf = std::get<0>(handle->remainSend);
                     size_t total = std::get<1>(handle->remainSend);
                     size_t offset = std::get<2>(handle->remainSend);
-                    if (!buf && handle->sendQueue.size_approx() > 0) {
-                        tuple<char*, size_t> t;
-                        if (handle->sendQueue.try_dequeue(t)) {
-                            buf = std::get<0>(t);
-                            total = std::get<1>(t);
-                            offset = 0;
-                            handle->remainSend = tuple<char*, size_t, size_t>(buf, total, offset);
-                        }
-                    }
+                    bool isWriteError = false;
 
-                    //printf("aaaaa total %d, offset %d\n", total, offset);
-
-                    while (offset < total) {
-                        size_t left = total - offset;
-                        size_t sendn = left > 1024 * 32 ? 1024 * 32 : left;
-                        size_t nwrite = write(handle->fd, buf + offset, sendn);
-                        printf("write len=%d\n", nwrite);
-                        if (nwrite < 0) {
-                            perror("write error");
-                            if (nwrite == -1 && errno != EAGAIN) {
-                                handle->is_closing = true;
-                                event.data.ptr = handle;
-                                event.events = EPOLLIN | EPOLLET;
-                                epoll_ctl(efd, EPOLL_CTL_MOD, handle->fd, &event);
+                    while ((buf || handle->sendQueue.size_approx() > 0) && !isWriteError) {
+                        if (nullptr == buf && handle->sendQueue.size_approx() > 0) {
+                            tuple<char*, size_t> t;
+                            if (handle->sendQueue.try_dequeue(t)) {
+                                buf = std::get<0>(t);
+                                total = std::get<1>(t);
+                                offset = 0;
+                                handle->remainSend = tuple<char*, size_t, size_t>(buf, total, offset);
                             }
-                            else if (nwrite == -1 && errno == EAGAIN) { //errno == EAGAIN buf 没有一次性发完
-                                printf("write EAGAIN\n");
-                            }
-                            break;
                         }
-                        offset += nwrite;
-                        std::get<2>(handle->remainSend) = offset;
-                        //printf("bbbbb total %d, offset %d\n", total, offset);
-                    };
 
-                    if (buf && offset == total) {
-                        //printf("cccccc total %d, offset %d\n", total, offset);
-                        handle->remainSend = tuple<char*, size_t, size_t>(nullptr, 0, 0);
-                        free(buf);
-                        buf = nullptr;
-                        if (!handle->isHandshaked) {
-                            handle->isHandshaked = true;
-                            //printf("handle->OnOpen %p\n", handle->OnOpen);
-                            if (handle->OnOpen != nullptr) {
-                                SockReadAccessor accessor;
-                                if (collector.find(accessor, handle)) {
-                                    auto h = accessor->second;
-                                    if (h->OnOpen) h->OnOpen(h);
+                        //printf("aaaaa total %d, offset %d\n", total, offset);
+                        while (offset < total) {
+                            size_t left = total - offset;
+                            size_t sendn = left > 1024 * 32 ? 1024 * 32 : left;
+                            ssize_t nwrite = write(handle->fd, buf + offset, sendn);
+                            //printf("write len=%d\n", nwrite);
+                            if (nwrite < 0) {
+                                perror("write error");
+                                if (nwrite == -1 && errno != EAGAIN) {
+                                    handle->is_closing = true;
+                                    isWriteError = true;
+                                    // event.data.ptr = handle;
+                                    // event.events = EPOLLIN | EPOLLET;
+                                    // epoll_ctl(efd, EPOLL_CTL_MOD, handle->fd, &event);
                                 }
-                                accessor.release();
+                                else if (nwrite == -1 && errno == EAGAIN) { //errno == EAGAIN buf 没有一次性发完
+                                    printf("write EAGAIN\n");
+                                }
+                                break;
+                            }
+                            offset += nwrite;
+                            std::get<2>(handle->remainSend) = offset;
+                            //printf("bbbbb total %d, offset %d\n", total, offset);
+                        };
+
+                        if (buf && offset == total) {
+                            //printf("cccccc total %d, offset %d\n", total, offset);
+                            handle->remainSend = tuple<char*, size_t, size_t>(nullptr, 0, 0);
+                            free(buf);
+                            buf = nullptr;
+                            if (!handle->isHandshaked) {
+                                handle->isHandshaked = true;
+                                //printf("handle->OnOpen %p\n", handle->OnOpen);
+                                if (handle->OnOpen != nullptr) {
+                                    SockReadAccessor accessor;
+                                    if (collector.find(accessor, handle)) {
+                                        auto h = accessor->second;
+                                        if (h->OnOpen) h->OnOpen(h);
+                                    }
+                                    accessor.release();
+                                }
                             }
                         }
                     }
 
                     //还有数据等待发送
-                    if (buf || handle->sendQueue.size_approx() > 0) {
-                        event.data.ptr = handle;
-                        event.events = EPOLLIN | EPOLLET | EPOLLOUT;
-                        epoll_ctl(efd, EPOLL_CTL_MOD, handle->fd, &event);
-                        //printf("22222222222\n");
-                    }
-
+                    // if (buf || handle->sendQueue.size_approx() > 0) {
+                    //     event.data.ptr = handle;
+                    //     event.events = EPOLLIN | EPOLLET | EPOLLOUT;
+                    //     epoll_ctl(efd, EPOLL_CTL_MOD, handle->fd, &event);
+                    // }
                     //printf("write=%d, total=%d, data=%s\n", offset, total, std::string(buf, total).c_str());
                 }
+
+
+                if (handle->is_closing) {
+                    epoll_ctl(efd, EPOLL_CTL_DEL, handle->fd, 0);
+                    handle_close(handle);
+                    events[i].data.ptr = nullptr;
+                }
+
+
             }
         }
 
